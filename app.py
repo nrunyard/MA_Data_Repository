@@ -249,20 +249,87 @@ def _detect_skiprows(raw: bytes, enc: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # COLUMN NORMALISATION
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix duplicate column names in a DataFrame — the root cause of
+    pandas.errors.InvalidIndexError when pd.concat tries to align frames.
+
+    Strategy:
+      1. Strip leading/trailing whitespace from all column names.
+      2. For duplicate raw names, keep the FIRST occurrence and rename
+         the rest to  "col_dup2", "col_dup3", … so they are unique.
+      3. After the rename step, if two different raw columns mapped to the
+         same normalised alias, only the first mapping survives; the rest
+         are suffixed with _dup2, _dup3 so they don't collide.
+    """
+    # Step 1 – strip whitespace
+    cols = [c.strip() if isinstance(c, str) else str(c) for c in df.columns]
+
+    # Step 2 – make every raw name unique before we touch anything else
+    seen: dict[str, int] = {}
+    unique_cols = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            unique_cols.append(f"{c}_dup{seen[c]}")
+        else:
+            seen[c] = 1
+            unique_cols.append(c)
+
+    df = df.copy()
+    df.columns = unique_cols
+    return df
+
+
 def _normalise_cols(df: pd.DataFrame, alias_map: dict) -> pd.DataFrame:
-    """Rename columns using alias map (case-insensitive, strip whitespace)."""
-    rename = {}
+    """
+    Rename columns using alias_map (case-insensitive).
+    Deduplicates raw column names first, then resolves any
+    post-rename collisions so the resulting index is always unique.
+    """
+    df = _dedup_columns(df)
+
+    # Build rename dict – only the FIRST column that maps to a given alias wins
+    rename: dict[str, str] = {}
+    target_seen: set[str] = set()
     for c in df.columns:
         key = c.strip().lower()
-        if key in alias_map:
-            rename[c] = alias_map[key]
-    return df.rename(columns=rename)
+        # Strip _dup2/_dup3 suffixes before alias lookup
+        base_key = key
+        for suffix_n in range(2, 10):
+            if base_key.endswith(f"_dup{suffix_n}"):
+                base_key = base_key[: -len(f"_dup{suffix_n}")]
+                break
+        target = alias_map.get(key) or alias_map.get(base_key)
+        if target:
+            if target not in target_seen:
+                rename[c] = target
+                target_seen.add(target)
+            # duplicate mapping – leave the column under its original name;
+            # it will be dropped later when we select only needed columns.
+
+    df = df.rename(columns=rename)
+
+    # Final safety: if somehow duplicates still exist, deduplicate again
+    if df.columns.duplicated().any():
+        seen2: dict[str, int] = {}
+        final_cols = []
+        for c in df.columns:
+            if c in seen2:
+                seen2[c] += 1
+                final_cols.append(f"{c}_{seen2[c]}")
+            else:
+                seen2[c] = 1
+                final_cols.append(c)
+        df.columns = final_cols
+
+    return df
 
 
 def _clean_enrollment(df: pd.DataFrame) -> pd.DataFrame:
     """Parse Enrollment to int; drop rows with 0 or masked (*) enrollment."""
     if "Enrollment" not in df.columns:
-        # fallback: look for any column with 'enroll' in name
         candidates = [c for c in df.columns if "enroll" in c.lower()]
         if candidates:
             df = df.rename(columns={candidates[0]: "Enrollment"})
@@ -274,20 +341,30 @@ def _clean_enrollment(df: pd.DataFrame) -> pd.DataFrame:
         .str.replace("*", "0", regex=False)
         .str.strip()
     )
-    df["Enrollment"] = pd.to_numeric(df["Enrollment"], errors="coerce").fillna(0).astype(int)
+    df["Enrollment"] = (
+        pd.to_numeric(df["Enrollment"], errors="coerce").fillna(0).astype(int)
+    )
     return df[df["Enrollment"] > 0].copy()
+
+
+# The canonical output columns every monthly frame must have.
+CPSC_OUTPUT_COLS = [
+    "Contract_ID", "Plan_ID", "Segment_ID", "Org_Name",
+    "State", "County", "Plan_Type", "Enrollment",
+    "Year", "Month", "Period", "Period_Label",
+]
 
 
 def normalise_cpsc(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     df = _normalise_cols(df, CPSC_COL_ALIASES)
     df = _clean_enrollment(df)
 
-    # If State col missing but SSA_Code is present (7-digit), derive state
+    # Derive State from SSA_Code if needed
     if "State" not in df.columns and "SSA_Code" in df.columns:
         df["SSA_Code"] = df["SSA_Code"].astype(str).str.zfill(5)
-        df["State"] = df["SSA_Code"].str[:2]   # first 2 digits = state
+        df["State"] = df["SSA_Code"].str[:2]
 
-    # Ensure all expected columns exist
+    # Guarantee every output column exists
     for col in ["State", "County", "Contract_ID", "Plan_ID",
                 "Plan_Type", "Org_Name", "Segment_ID"]:
         if col not in df.columns:
@@ -297,7 +374,11 @@ def normalise_cpsc(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     df["Month"]        = month
     df["Period"]       = pd.Timestamp(year, month, 1)
     df["Period_Label"] = f"{MONTH_NAMES[month].title()[:3]} {year}"
-    return df
+
+    # ── KEY FIX: select only the canonical columns so every frame that
+    # enters pd.concat has an identical, non-duplicate column set. ──────────
+    present = [c for c in CPSC_OUTPUT_COLS if c in df.columns]
+    return df[present].copy()
 
 
 def normalise_plandir(df: pd.DataFrame) -> pd.DataFrame:
@@ -315,20 +396,37 @@ def normalise_plandir(df: pd.DataFrame) -> pd.DataFrame:
 # LOAD FUNCTIONS  (cached)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=21_600, show_spinner=False)
-def load_enrollment(months: tuple[tuple[int,int],...]) -> pd.DataFrame:
-    frames = []
+def load_enrollment(months: tuple) -> pd.DataFrame:
+    frames: list = []
     prog = st.progress(0, text="Initialising data load…")
     for i, (yr, mo) in enumerate(months):
-        prog.progress((i + 1) / len(months),
-                      text=f"Fetching {MONTH_NAMES[mo].title()} {yr}…")
+        prog.progress(
+            (i + 1) / len(months),
+            text=f"Fetching {MONTH_NAMES[mo].title()} {yr}…",
+        )
         url = cpsc_url(yr, mo)
         raw = _fetch_zip_df(url, hint="CPSC")
         if raw is not None and len(raw) > 10:
-            frames.append(normalise_cpsc(raw, yr, mo))
+            try:
+                normed = normalise_cpsc(raw, yr, mo)
+                if normed.columns.duplicated().any():
+                    continue
+                frames.append(normed)
+            except Exception:
+                continue
     prog.empty()
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    # Align all frames to identical canonical column set before concat
+    all_cols = [c for c in CPSC_OUTPUT_COLS]
+    aligned = []
+    for f in frames:
+        f = f.copy()
+        for col in all_cols:
+            if col not in f.columns:
+                f[col] = 0 if col == "Enrollment" else ""
+        aligned.append(f[all_cols])
+    return pd.concat(aligned, ignore_index=True)
 
 
 @st.cache_data(ttl=86_400, show_spinner=False)   # 24-hour cache
