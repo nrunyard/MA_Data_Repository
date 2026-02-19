@@ -162,7 +162,10 @@ CHART_COLORS = px.colors.qualitative.Set2 + px.colors.qualitative.Pastel
 # Live HTTP fetch is kept as a fallback for local dev / first-run before the
 # Action has run.
 
-DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
+# Resolve data/ directory relative to this script.
+# os.path.abspath handles edge cases where __file__ is relative or missing.
+_HERE         = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR      = os.path.join(_HERE, "data")
 CPSC_DIR      = os.path.join(DATA_DIR, "cpsc")
 PLANDIR_DIR   = os.path.join(DATA_DIR, "plandir")
 
@@ -943,6 +946,18 @@ def main():
                 )
                 enroll_df, plan_df = demo_data()
                 src_label = "🟡 Demo fallback — run the Fetch CMS Data action in GitHub"
+                with st.expander("🔍 Debug: data directory contents"):
+                    st.code(
+                        f"Looking in: {DATA_DIR}\n"
+                        f"data/ exists: {os.path.isdir(DATA_DIR)}\n"
+                        f"cpsc/ exists: {os.path.isdir(CPSC_DIR)}\n"
+                        f"plandir/ exists: {os.path.isdir(PLANDIR_DIR)}\n"
+                        + (f"cpsc files: {sorted(os.listdir(CPSC_DIR))}"
+                           if os.path.isdir(CPSC_DIR) else "cpsc/ not found")
+                        + "\n"
+                        + (f"plandir files: {sorted(os.listdir(PLANDIR_DIR))}"
+                           if os.path.isdir(PLANDIR_DIR) else "plandir/ not found")
+                    )
             else:
                 local_n = enroll_df.attrs.get("local_count", 0)
                 live_n  = enroll_df.attrs.get("live_count",  0)
