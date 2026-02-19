@@ -1,0 +1,19 @@
+[theme]
+primaryColor       = "#003087"
+backgroundColor    = "#FFFFFF"
+secondaryBackgroundColor = "#F0F4FB"
+textColor          = "#1A1A2E"
+font               = "sans serif"
+
+[server]
+headless           = true
+enableCORS         = false
+enableXsrfProtection = false
+maxUploadSize      = 50
+
+[browser]
+gatherUsageStats   = false
+
+[runner]
+# Silences the "missing ScriptRunContext" warning in scheduled pings
+enforceSerializableSessionState = false

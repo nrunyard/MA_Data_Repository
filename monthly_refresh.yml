@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Monthly CMS Data Refresh
+# ─────────────────────────────────────────────────────────────────────────────
+# CMS publishes new monthly enrollment files by the 15th of each month.
+# This workflow runs on the 16th at 08:00 UTC, pings your Streamlit app to
+# wake it, then triggers a cache-clearing "refresh" URL parameter so the
+# app fetches the newest file automatically.
+#
+# HOW TO SET UP:
+#   1. In your GitHub repo → Settings → Secrets and variables → Actions
+#   2. Add a secret named: STREAMLIT_APP_URL
+#      Value: the full URL of your deployed app, e.g.
+#        https://yourname-ma-enrollment-dashboard-app-xxxx.streamlit.app
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Monthly CMS Data Refresh
+
+on:
+  schedule:
+    # 16th of every month at 08:00 UTC  (CMS publishes by the 15th)
+    - cron: "0 8 16 * *"
+
+  # Allow manual trigger from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Wake + ping the app ──────────────────────────────────────────────
+      - name: Ping Streamlit app (wake from sleep)
+        run: |
+          APP_URL="${{ secrets.STREAMLIT_APP_URL }}"
+          if [ -z "$APP_URL" ]; then
+            echo "⚠️  STREAMLIT_APP_URL secret not set – skipping ping."
+            echo "    Add it under: Settings → Secrets → Actions"
+            exit 0
+          fi
+          echo "Pinging: $APP_URL"
+          # First ping wakes the app (Streamlit Cloud sleeps after inactivity)
+          curl -sSf --max-time 60 "$APP_URL" > /dev/null && echo "✅ App is up" || true
+          # Wait a moment for app to fully start
+          sleep 15
+          # Second ping after startup
+          curl -sSf --max-time 60 "$APP_URL" > /dev/null && echo "✅ Second ping OK" || true
+
+      # ── 2. Commit a date-stamp file to bust Streamlit's cache ───────────────
+      #   Streamlit Community Cloud redeploys on new commits, which clears
+      #   st.cache_data. We write a tiny JSON with today's date so the app
+      #   always re-fetches the newest CMS file after the 16th.
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Write refresh timestamp
+        run: |
+          mkdir -p .streamlit
+          echo "{\"last_refresh\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"month\": \"$(date -u +%B %Y)\"}" \
+            > .streamlit/last_refresh.json
+          echo "Wrote timestamp: $(cat .streamlit/last_refresh.json)"
+
+      - name: Commit & push timestamp
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .streamlit/last_refresh.json
+          git diff --cached --quiet && echo "No changes" || \
+            git commit -m "chore: monthly CMS data refresh $(date -u +%B %Y)"
+          git push
