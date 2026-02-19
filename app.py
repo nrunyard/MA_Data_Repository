@@ -558,12 +558,17 @@ def kpi(label: str, value: str, delta_pct: float | None = None,
 _LAYOUT = dict(
     plot_bgcolor="white", paper_bgcolor="white",
     font=dict(family="Arial, sans-serif", size=12),
-    margin=dict(t=52, b=16, l=8, r=8),
     hovermode="x unified",
 )
+_MARGIN_DEFAULT = dict(t=52, b=16, l=8,  r=8)
+_MARGIN_DONUT   = dict(t=52, b=20, l=20, r=20)
 
-def _apply(fig, height=420, legend_below=True):
-    fig.update_layout(**_LAYOUT, height=height)
+def _apply(fig, height=420, legend_below=True, margin=None):
+    fig.update_layout(
+        **_LAYOUT,
+        height=height,
+        margin=margin if margin is not None else _MARGIN_DEFAULT,
+    )
     if legend_below:
         fig.update_layout(legend=dict(orientation="h", y=-0.22, x=0))
     return fig
@@ -594,9 +599,8 @@ def chart_donut(df: pd.DataFrame) -> go.Figure:
                  color_discrete_sequence=CHART_COLORS)
     fig.update_traces(textposition="outside", textinfo="percent+label",
                       textfont_size=11)
-    fig.update_layout(**_LAYOUT, height=400, showlegend=False,
-                      margin=dict(t=52, b=20, l=20, r=20))
-    return fig
+    fig.update_layout(showlegend=False)
+    return _apply(fig, height=400, legend_below=False, margin=_MARGIN_DONUT)
 
 
 def chart_mom_change(df: pd.DataFrame, group: str) -> go.Figure:
@@ -632,8 +636,8 @@ def chart_state_map(df: pd.DataFrame) -> go.Figure:
                         title="Enrollment by State (Latest Month)",
                         color_continuous_scale="Blues",
                         labels={"Enrollment":"Total Enrolled"})
-    fig.update_layout(**_LAYOUT, height=400,
-                      geo=dict(bgcolor="white"),
+    _apply(fig, height=400, legend_below=False)
+    fig.update_layout(geo=dict(bgcolor="white"),
                       coloraxis_colorbar=dict(thickness=12))
     return fig
 
@@ -646,8 +650,8 @@ def chart_top_counties(df: pd.DataFrame, n: int = 15) -> go.Figure:
                  color="Enrollment", color_continuous_scale="Blues",
                  title=f"Top {n} Counties (Latest Month)",
                  labels={"Label":"","Enrollment":"Total Enrolled"})
-    fig.update_layout(**_LAYOUT, height=420,
-                      yaxis=dict(autorange="reversed"),
+    _apply(fig, height=420, legend_below=False)
+    fig.update_layout(yaxis=dict(autorange="reversed"),
                       coloraxis_showscale=False)
     return fig
 
@@ -670,8 +674,8 @@ def chart_yoy(df: pd.DataFrame, group: str) -> go.Figure | None:
                  title=f"Year-over-Year Enrollment Change (%) by {group.replace('_',' ')}",
                  labels={"YoY_Pct":"YoY % Change", group:""})
     fig.add_vline(x=0, line_dash="dash", line_color="#888")
-    fig.update_layout(**_LAYOUT, height=max(340, len(chg)*28),
-                      coloraxis_showscale=False)
+    _apply(fig, height=max(340, len(chg)*28), legend_below=False)
+    fig.update_layout(coloraxis_showscale=False)
     return fig
 
 
