@@ -1,0 +1,181 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch CMS Enrollment Data → commit CSVs to repo
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS EXISTS:
+#   Streamlit Community Cloud cannot reliably reach cms.gov at runtime
+#   (network restrictions, timeouts, CMS maintenance windows).
+#   This GitHub Action runs on GitHub's servers — which CAN reach cms.gov —
+#   downloads the last 24 months of CPSC enrollment ZIPs + the Plan Directory,
+#   extracts the CSVs, and commits them to data/ in the repo.
+#   The Streamlit app then reads local files instead of making live HTTP calls.
+#
+# SCHEDULE: Runs on the 16th of each month at 09:00 UTC
+#           (CMS publishes new files by the 15th)
+#
+# MANUAL:   You can also trigger this from Actions → "Fetch CMS Data" → Run workflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Fetch CMS Data
+
+on:
+  schedule:
+    - cron: "0 9 16 * *"      # 16th of month, 09:00 UTC
+  workflow_dispatch:           # manual trigger
+
+jobs:
+  fetch-and-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas openpyxl
+
+      - name: Download CMS files and extract CSVs
+        run: |
+          python - << 'PYEOF'
+          import requests, zipfile, io, os, shutil
+          from datetime import date
+          from dateutil.relativedelta import relativedelta
+
+          # Install dateutil if missing
+          try:
+              from dateutil.relativedelta import relativedelta
+          except ImportError:
+              os.system("pip install python-dateutil -q")
+              from dateutil.relativedelta import relativedelta
+
+          MONTH_NAMES = {
+              1:"january",2:"february",3:"march",4:"april",5:"may",6:"june",
+              7:"july",8:"august",9:"september",10:"october",
+              11:"november",12:"december"
+          }
+
+          def rolling_months(n=24):
+              base = date.today().replace(day=1) - relativedelta(months=2)
+              return [
+                  ((base - relativedelta(months=i)).year,
+                   (base - relativedelta(months=i)).month)
+                  for i in range(n)
+              ]
+
+          def fetch_zip(url):
+              print(f"  GET {url}")
+              try:
+                  r = requests.get(url, timeout=120,
+                                   headers={"User-Agent":"Mozilla/5.0 (compatible)"})
+                  if r.status_code == 200:
+                      return r.content
+                  print(f"    → HTTP {r.status_code}")
+              except Exception as e:
+                  print(f"    → Error: {e}")
+              return None
+
+          def pick_file(names):
+              for n in names:
+                  if "__MACOSX" in n or n.startswith("."): continue
+                  if n.lower().endswith(".csv"): return n
+              for n in names:
+                  if "__MACOSX" in n or n.startswith("."): continue
+                  if n.lower().endswith((".xlsx",".xls")): return n
+              return None
+
+          def extract_csv_bytes(zip_bytes, hint=""):
+              with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                  names = z.namelist()
+                  # prefer hint match
+                  target = None
+                  if hint:
+                      for n in names:
+                          if hint.lower() in n.lower() and \
+                             n.lower().endswith((".csv",".xlsx",".xls")):
+                              target = n; break
+                  if target is None:
+                      target = pick_file(names)
+                  if target is None:
+                      return None, None
+                  ext = os.path.splitext(target)[1].lower()
+                  return z.read(target), ext
+
+          # ── Create data directory ──
+          os.makedirs("data/cpsc", exist_ok=True)
+          os.makedirs("data/plandir", exist_ok=True)
+
+          # ── Fetch CPSC monthly enrollment files (last 24 months) ──
+          months = rolling_months(24)
+          cpsc_ok, cpsc_fail = 0, 0
+          for yr, mo in months:
+              fname = f"data/cpsc/cpsc-{yr}-{mo:02d}"
+              # Skip if already downloaded (don't re-download same file)
+              if os.path.exists(fname + ".csv") or os.path.exists(fname + ".xlsx"):
+                  print(f"  ✓ Already have {yr}-{mo:02d}, skipping")
+                  cpsc_ok += 1
+                  continue
+              url = (f"https://www.cms.gov/files/zip/"
+                     f"monthly-enrollment-cpsc-{MONTH_NAMES[mo]}-{yr}.zip")
+              raw = fetch_zip(url)
+              if raw:
+                  data_bytes, ext = extract_csv_bytes(raw, hint="CPSC")
+                  if data_bytes:
+                      out = fname + ext
+                      with open(out, "wb") as f:
+                          f.write(data_bytes)
+                      print(f"  ✅ Saved {out} ({len(data_bytes):,} bytes)")
+                      cpsc_ok += 1
+                  else:
+                      print(f"  ⚠️  No CSV found in ZIP for {yr}-{mo:02d}")
+                      cpsc_fail += 1
+              else:
+                  cpsc_fail += 1
+
+          print(f"\nCPSC: {cpsc_ok} saved, {cpsc_fail} failed")
+
+          # ── Fetch Plan Directory (try last 6 months) ──
+          plandir_saved = False
+          for yr, mo in rolling_months(6):
+              url = (f"https://www.cms.gov/files/zip/"
+                     f"plan-directory-{MONTH_NAMES[mo]}-{yr}.zip")
+              raw = fetch_zip(url)
+              if raw:
+                  data_bytes, ext = extract_csv_bytes(raw, hint="Plan_Directory")
+                  if data_bytes:
+                      out = f"data/plandir/plan-directory{ext}"
+                      with open(out, "wb") as f:
+                          f.write(data_bytes)
+                      print(f"✅ Plan Directory saved: {out}")
+                      plandir_saved = True
+                      break
+          if not plandir_saved:
+              print("⚠️  Could not fetch Plan Directory")
+
+          # ── Write manifest ──
+          import json
+          from datetime import datetime
+          manifest = {
+              "fetched_at": datetime.utcnow().isoformat() + "Z",
+              "cpsc_files": sorted(os.listdir("data/cpsc")),
+              "plandir_files": sorted(os.listdir("data/plandir")),
+          }
+          with open("data/manifest.json","w") as f:
+              json.dump(manifest, f, indent=2)
+          print(f"\n📋 Manifest: {len(manifest['cpsc_files'])} CPSC files, "
+                f"{len(manifest['plandir_files'])} plandir files")
+          PYEOF
+
+      - name: Commit and push data files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet \
+            && echo "ℹ️  No new data files to commit." \
+            || (git commit -m "data: CMS enrollment refresh $(date -u '+%B %Y')" && git push)
+          echo "✅ Done"

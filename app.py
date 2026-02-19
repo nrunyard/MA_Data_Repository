@@ -153,8 +153,19 @@ CHART_COLORS = px.colors.qualitative.Set2 + px.colors.qualitative.Pastel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL BUILDERS
+# URL BUILDERS  +  LOCAL DATA PATH HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+# The GitHub Action (fetch_cms_data.yml) downloads CMS ZIPs on GitHub's
+# servers (which CAN reach cms.gov) and commits the extracted CSVs into
+#   data/cpsc/cpsc-YYYY-MM.csv   and   data/plandir/plan-directory.csv
+# The app reads those local files directly — no runtime HTTP to cms.gov needed.
+# Live HTTP fetch is kept as a fallback for local dev / first-run before the
+# Action has run.
+
+DATA_DIR      = os.path.join(os.path.dirname(__file__), "data")
+CPSC_DIR      = os.path.join(DATA_DIR, "cpsc")
+PLANDIR_DIR   = os.path.join(DATA_DIR, "plandir")
+
 def cpsc_url(year: int, month: int) -> str:
     return (
         f"https://www.cms.gov/files/zip/"
@@ -170,22 +181,57 @@ def plandir_url(year: int, month: int) -> str:
 def rolling_months(n: int = 24) -> list[tuple[int, int]]:
     """Last n months (most-recent first), offset 2 months for CMS lag."""
     base = date.today().replace(day=1) - relativedelta(months=2)
-    return [(( base - relativedelta(months=i)).year,
+    return [((base - relativedelta(months=i)).year,
               (base - relativedelta(months=i)).month)
             for i in range(n)]
 
+def _local_cpsc_path(year: int, month: int) -> str | None:
+    """Return path to pre-fetched CPSC file if it exists, else None."""
+    for ext in (".csv", ".xlsx", ".xls"):
+        p = os.path.join(CPSC_DIR, f"cpsc-{year}-{month:02d}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
+
+def _local_plandir_path() -> str | None:
+    """Return path to pre-fetched Plan Directory file if it exists."""
+    if not os.path.isdir(PLANDIR_DIR):
+        return None
+    for fname in sorted(os.listdir(PLANDIR_DIR), reverse=True):
+        if fname.startswith("plan-directory") and fname.endswith((".csv",".xlsx",".xls")):
+            return os.path.join(PLANDIR_DIR, fname)
+    return None
+
+def _read_local_file(path: str) -> pd.DataFrame | None:
+    """Read a local CSV or Excel file into a DataFrame."""
+    try:
+        raw = open(path, "rb").read()
+        if path.lower().endswith(".csv"):
+            for enc in ("utf-8", "latin-1", "cp1252"):
+                try:
+                    buf = io.BytesIO(raw)
+                    df = pd.read_csv(buf, encoding=enc, low_memory=False,
+                                     skiprows=_detect_skiprows(raw, enc))
+                    if len(df.columns) >= 3:
+                        return df
+                except Exception:
+                    continue
+            return None
+        else:
+            return pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+    except Exception:
+        return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ZIP DOWNLOAD + PARSE
+# ZIP DOWNLOAD + PARSE  (live HTTP fallback — used only when local files absent)
 # ─────────────────────────────────────────────────────────────────────────────
 def _pick_file(names: list[str], preferred_hint: str = "") -> str | None:
     """Pick best CSV/XLSX from zip namelist."""
-    # prefer hint match
     for n in names:
         if preferred_hint and preferred_hint.lower() in n.lower():
             if n.lower().endswith((".csv", ".xlsx", ".xls")):
                 return n
-    # skip __MACOSX, pick first data file
     for n in names:
         if "__MACOSX" in n or n.startswith("."):
             continue
@@ -199,7 +245,7 @@ def _pick_file(names: list[str], preferred_hint: str = "") -> str | None:
     return None
 
 
-@st.cache_data(ttl=21_600, show_spinner=False)   # 6-hour cache
+@st.cache_data(ttl=21_600, show_spinner=False)
 def _fetch_zip_df(url: str, hint: str = "") -> pd.DataFrame | None:
     """Download a CMS zip and return its first CSV/Excel as DataFrame."""
     try:
@@ -393,32 +439,59 @@ def normalise_plandir(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOAD FUNCTIONS  (cached)
+# LOAD FUNCTIONS  (local files first → live HTTP fallback)
 # ─────────────────────────────────────────────────────────────────────────────
+def _load_one_cpsc(yr: int, mo: int) -> pd.DataFrame | None:
+    """
+    Load one month of CPSC data.
+    Priority: local pre-fetched file → live HTTP download.
+    """
+    # 1. Local file (committed by GitHub Action)
+    local = _local_cpsc_path(yr, mo)
+    if local:
+        df = _read_local_file(local)
+        if df is not None and len(df) > 10:
+            return df
+
+    # 2. Live HTTP fallback
+    return _fetch_zip_df(cpsc_url(yr, mo), hint="CPSC")
+
+
 @st.cache_data(ttl=21_600, show_spinner=False)
 def load_enrollment(months: tuple) -> pd.DataFrame:
     frames: list = []
+    local_count  = 0
+    live_count   = 0
     prog = st.progress(0, text="Initialising data load…")
+
     for i, (yr, mo) in enumerate(months):
         prog.progress(
             (i + 1) / len(months),
-            text=f"Fetching {MONTH_NAMES[mo].title()} {yr}…",
+            text=f"Loading {MONTH_NAMES[mo].title()} {yr}…",
         )
-        url = cpsc_url(yr, mo)
-        raw = _fetch_zip_df(url, hint="CPSC")
+        # Determine source for status tracking
+        local_path = _local_cpsc_path(yr, mo)
+        raw = _load_one_cpsc(yr, mo)
+
         if raw is not None and len(raw) > 10:
             try:
                 normed = normalise_cpsc(raw, yr, mo)
                 if normed.columns.duplicated().any():
                     continue
                 frames.append(normed)
+                if local_path:
+                    local_count += 1
+                else:
+                    live_count += 1
             except Exception:
                 continue
+
     prog.empty()
     if not frames:
         return pd.DataFrame()
+
     # Align all frames to identical canonical column set before concat
-    all_cols = [c for c in CPSC_OUTPUT_COLS]
+    all_cols = list(CPSC_OUTPUT_COLS)
     aligned = []
     for f in frames:
         f = f.copy()
@@ -426,12 +499,25 @@ def load_enrollment(months: tuple) -> pd.DataFrame:
             if col not in f.columns:
                 f[col] = 0 if col == "Enrollment" else ""
         aligned.append(f[all_cols])
-    return pd.concat(aligned, ignore_index=True)
+
+    result = pd.concat(aligned, ignore_index=True)
+    # Store source info as a DataFrame attribute for the status banner
+    result.attrs["local_count"] = local_count
+    result.attrs["live_count"]  = live_count
+    return result
 
 
-@st.cache_data(ttl=86_400, show_spinner=False)   # 24-hour cache
+@st.cache_data(ttl=86_400, show_spinner=False)
 def load_plan_directory() -> pd.DataFrame:
-    """Try last 6 months until a plan directory zip succeeds."""
+    """Local pre-fetched file first, then live HTTP fallback (last 6 months)."""
+    # 1. Local file
+    local = _local_plandir_path()
+    if local:
+        df = _read_local_file(local)
+        if df is not None and len(df) > 5:
+            return normalise_plandir(df)
+
+    # 2. Live HTTP fallback
     for yr, mo in rolling_months(6):
         raw = _fetch_zip_df(plandir_url(yr, mo), hint="Plan_Directory")
         if raw is not None and len(raw) > 5:
@@ -850,15 +936,27 @@ def main():
             plan_df    = load_plan_directory()
             if enroll_df.empty:
                 st.warning(
-                    "⚠️ Could not reach CMS servers. Falling back to demo data. "
-                    "This is common on restricted networks or when CMS is publishing "
-                    "a new month's files. Try again after the 15th of the month."
+                    "⚠️ Could not load CMS data from local files or live servers. "
+                    "Go to your GitHub repo → Actions → **Fetch CMS Data** → "
+                    "**Run workflow** to download the data files. "
+                    "Falling back to demo data for now."
                 )
                 enroll_df, plan_df = demo_data()
-                src_label = "🟡 Demo fallback — CMS unavailable"
+                src_label = "🟡 Demo fallback — run the Fetch CMS Data action in GitHub"
             else:
+                local_n = enroll_df.attrs.get("local_count", 0)
+                live_n  = enroll_df.attrs.get("live_count",  0)
+                if local_n > 0 and live_n == 0:
+                    src_icon = "🟢"
+                    src_note = f"local repo files ({local_n} months)"
+                elif local_n > 0:
+                    src_icon = "🟢"
+                    src_note = f"local files ({local_n}) + live ({live_n} months)"
+                else:
+                    src_icon = "🟡"
+                    src_note = f"live CMS download ({live_n} months)"
                 src_label = (
-                    f"🟢 Live CMS data &nbsp;·&nbsp; "
+                    f"{src_icon} CMS data via {src_note} &nbsp;·&nbsp; "
                     f"{len(enroll_df):,} rows &nbsp;·&nbsp; "
                     f"{enroll_df['Period'].nunique()} months loaded"
                 )
